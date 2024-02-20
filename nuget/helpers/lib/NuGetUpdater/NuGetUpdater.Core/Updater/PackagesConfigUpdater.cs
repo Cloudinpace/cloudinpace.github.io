@@ -4,15 +4,28 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
-using System.Xml.Linq;
 
 using Microsoft.Language.Xml;
+
+using NuGet.CommandLine;
+
+using NuGetUpdater.Core.Updater;
+
+using Console = System.Console;
 
 namespace NuGetUpdater.Core;
 
 internal static class PackagesConfigUpdater
 {
-    public static async Task UpdateDependencyAsync(string repoRootPath, string projectPath, string dependencyName, string previousDependencyVersion, string newDependencyVersion, bool isTransitive, Logger logger)
+    public static async Task UpdateDependencyAsync(
+        string repoRootPath,
+        string projectPath,
+        string dependencyName,
+        string previousDependencyVersion,
+        string newDependencyVersion,
+        bool isTransitive,
+        Logger logger
+    )
     {
         logger.Log($"  Found {NuGetHelper.PackagesConfigFileName}; running with NuGet.exe");
 
@@ -35,18 +48,18 @@ internal static class PackagesConfigUpdater
         var packagesDirectory = PathHelper.JoinPath(projectDirectory, packagesSubDirectory);
         Directory.CreateDirectory(packagesDirectory);
 
-        var args = new List<string>()
-            {
-                "update",
-                packagesConfigPath,
-                "-Id",
-                dependencyName,
-                "-Version",
-                newDependencyVersion,
-                "-RepositoryPath",
-                packagesDirectory,
-                "-NonInteractive",
-            };
+        var args = new List<string>
+        {
+            "update",
+            packagesConfigPath,
+            "-Id",
+            dependencyName,
+            "-Version",
+            newDependencyVersion,
+            "-RepositoryPath",
+            packagesDirectory,
+            "-NonInteractive",
+        };
 
         logger.Log("    Finding MSBuild...");
         var msbuildDirectory = MSBuildHelper.MSBuildPath;
@@ -56,7 +69,10 @@ internal static class PackagesConfigUpdater
             args.Add(msbuildDirectory); // e.g., /usr/share/dotnet/sdk/7.0.203
         }
 
-        RunNuget(args, packagesDirectory, logger);
+        using (new WebApplicationTargetsConditionPatcher(projectPath))
+        {
+            RunNuget(args, packagesDirectory, logger);
+        }
 
         projectBuildFile = ProjectBuildFile.Open(repoRootPath, projectPath);
         projectBuildFile.NormalizeDirectorySeparatorsInProject();
@@ -84,7 +100,7 @@ internal static class PackagesConfigUpdater
             logger.Log($"    Running NuGet.exe with args: {string.Join(" ", args)}");
 
             Environment.CurrentDirectory = packagesDirectory;
-            var result = NuGet.CommandLine.Program.Main(args.ToArray());
+            var result = Program.Main(args.ToArray());
             var fullOutput = outputBuilder.ToString();
             logger.Log($"    Result: {result}");
             logger.Log($"    Output:\n{fullOutput}");
@@ -118,8 +134,11 @@ internal static class PackagesConfigUpdater
         // </Project>
         //
         // the result should be "..\packages"
+        //
+        // first try to do an exact match with the provided version number, but optionally fall back to just matching the package name and _any_ version
         var hintPathSubString = $"{dependencyName}.{dependencyVersion}";
 
+        string? partialPathMatch = null;
         var hintPathNodes = projectBuildFile.Contents.Descendants()
             .Where(e =>
                 e.Name.Equals("HintPath", StringComparison.OrdinalIgnoreCase) &&
@@ -128,19 +147,42 @@ internal static class PackagesConfigUpdater
         foreach (var hintPathNode in hintPathNodes)
         {
             var hintPath = hintPathNode.GetContentValue();
-            var hintPathSubStringLocation = hintPath.IndexOf(hintPathSubString);
+            var hintPathSubStringLocation = hintPath.IndexOf(hintPathSubString, StringComparison.OrdinalIgnoreCase);
             if (hintPathSubStringLocation >= 0)
             {
-                var subpath = hintPath[..hintPathSubStringLocation];
-                if (subpath.EndsWith("/") || subpath.EndsWith("\\"))
-                {
-                    subpath = subpath[..^1];
-                }
-
+                // exact match was found, use it
+                var subpath = GetUpToIndexWithoutTrailingDirectorySeparator(hintPath, hintPathSubStringLocation);
                 return subpath;
+            }
+
+            if (partialPathMatch is null)
+            {
+                var partialHintPathSubStringLocation = hintPath.IndexOf($"{dependencyName}.", StringComparison.OrdinalIgnoreCase);
+                if (partialHintPathSubStringLocation >= 0)
+                {
+                    // look instead for, e.g., "Newtonsoft.Json.<digit>"
+                    var candidateVersionLocation = partialHintPathSubStringLocation + dependencyName.Length + 1; // 1 is the dot
+                    if (hintPath.Length > candidateVersionLocation && char.IsDigit(hintPath[candidateVersionLocation]))
+                    {
+                        // partial match was found, save it in case we don't find anything better
+                        var subpath = GetUpToIndexWithoutTrailingDirectorySeparator(hintPath, partialHintPathSubStringLocation);
+                        partialPathMatch = subpath;
+                    }
+                }
             }
         }
 
-        return null;
+        return partialPathMatch;
+    }
+
+    private static string GetUpToIndexWithoutTrailingDirectorySeparator(string path, int index)
+    {
+        var subpath = path[..index];
+        if (subpath.EndsWith('/') || subpath.EndsWith('\\'))
+        {
+            subpath = subpath[..^1];
+        }
+
+        return subpath;
     }
 }

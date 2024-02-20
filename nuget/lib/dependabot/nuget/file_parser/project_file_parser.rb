@@ -7,14 +7,16 @@ require "dependabot/dependency"
 require "dependabot/nuget/file_parser"
 require "dependabot/nuget/update_checker"
 require "dependabot/nuget/cache_manager"
+require "dependabot/nuget/nuget_client"
 
 # For details on how dotnet handles version constraints, see:
 # https://docs.microsoft.com/en-us/nuget/reference/package-versioning
 module Dependabot
   module Nuget
     class FileParser
-      # rubocop:disable Metrics/ClassLength
-      class ProjectFileParser
+      class ProjectFileParser # rubocop:disable Metrics/ClassLength
+        extend T::Sig
+
         require "dependabot/file_parsers/base/dependency_set"
         require_relative "property_value_finder"
         require_relative "../update_checker/repository_finder"
@@ -26,6 +28,8 @@ module Dependabot
                               "ItemGroup > DevelopmentDependency"
 
         PROJECT_REFERENCE_SELECTOR = "ItemGroup > ProjectReference"
+
+        PROJECT_FILE_SELECTOR = "ItemGroup > ProjectFile"
 
         PACKAGE_REFERENCE_SELECTOR = "ItemGroup > PackageReference, " \
                                      "ItemGroup > GlobalPackageReference"
@@ -44,22 +48,41 @@ module Dependabot
           CacheManager.cache("dependency_url_search_cache")
         end
 
-        def initialize(dependency_files:, credentials:)
+        def initialize(dependency_files:, credentials:, repo_contents_path:)
           @dependency_files       = dependency_files
           @credentials            = credentials
+          @repo_contents_path     = repo_contents_path
         end
 
-        def dependency_set(project_file:)
-          return parse_dependencies(project_file) if CacheManager.caching_disabled?
-
+        def dependency_set(project_file:, visited_project_files: Set.new)
           key = "#{project_file.name.downcase}::#{project_file.content.hash}"
           cache = ProjectFileParser.dependency_set_cache
 
-          cache[key] ||= parse_dependencies(project_file)
+          visited_project_files.add(cache[key])
 
-          dependency_set = Dependabot::FileParsers::Base::DependencySet.new
-          dependency_set += cache[key]
-          dependency_set
+          # Pass the visited_project_files set to parse_dependencies
+          cache[key] ||= parse_dependencies(project_file, visited_project_files)
+        end
+
+        def downstream_file_references(project_file:)
+          file_set = Set.new
+
+          doc = Nokogiri::XML(project_file.content)
+          doc.remove_namespaces!
+          proj_refs = doc.css(PROJECT_REFERENCE_SELECTOR)
+          proj_files = doc.css(PROJECT_FILE_SELECTOR)
+          ref_nodes = proj_refs + proj_files
+          ref_nodes.each do |project_reference_node|
+            dep_file = get_attribute_value(project_reference_node, "Include")
+            full_project_path = full_path(project_file, dep_file)
+            full_project_path = full_project_path[1..-1] if full_project_path.start_with?("/")
+            full_project_paths = expand_wildcards_in_project_reference_path(full_project_path)
+            full_project_paths.each do |full_project_path_expanded|
+              file_set << full_project_path_expanded if full_project_path_expanded
+            end
+          end
+
+          file_set
         end
 
         def target_frameworks(project_file:)
@@ -78,11 +101,30 @@ module Dependabot
           ["net#{value[1..-1].delete('.')}"]
         end
 
+        def nuget_configs
+          dependency_files.select { |f| f.name.match?(%r{(^|/)nuget\.config$}i) }
+        end
+
         private
 
         attr_reader :dependency_files, :credentials
 
-        def parse_dependencies(project_file)
+        def full_path(project_file, ref_path)
+          project_file_directory = File.dirname(project_file.name)
+          is_rooted = project_file_directory.start_with?("/")
+          # Root the directory path to avoid expand_path prepending the working directory
+          project_file_directory = "/" + project_file_directory unless is_rooted
+
+          # normalize path separators
+          relative_path = ref_path.tr("\\", "/")
+          # path is relative to the project file directory
+          relative_path = File.join(project_file_directory, relative_path)
+          result = File.expand_path(relative_path)
+          result = result[1..-1] unless is_rooted
+          result
+        end
+
+        def parse_dependencies(project_file, visited_project_files)
           dependency_set = Dependabot::FileParsers::Base::DependencySet.new
 
           doc = Nokogiri::XML(project_file.content)
@@ -101,7 +143,7 @@ module Dependabot
 
           add_global_package_references(dependency_set)
 
-          add_transitive_dependencies(project_file, doc, dependency_set)
+          add_transitive_dependencies(project_file, doc, dependency_set, visited_project_files)
 
           # Look for SDK references; see:
           # https://docs.microsoft.com/en-us/visualstudio/msbuild/how-to-use-project-sdk
@@ -127,45 +169,72 @@ module Dependabot
           end
         end
 
-        def add_transitive_dependencies(project_file, doc, dependency_set)
+        def add_transitive_dependencies(project_file, doc, dependency_set, visited_project_files)
           add_transitive_dependencies_from_packages(dependency_set)
-          add_transitive_dependencies_from_project_references(project_file, doc, dependency_set)
+          add_transitive_dependencies_from_project_references(project_file, doc, dependency_set, visited_project_files)
         end
 
-        def add_transitive_dependencies_from_project_references(project_file, doc, dependency_set)
-          project_file_directory = File.dirname(project_file.name)
-          is_rooted = project_file_directory.start_with?("/")
-          # Root the directory path to avoid expand_path prepending the working directory
-          project_file_directory = "/" + project_file_directory unless is_rooted
+        def add_transitive_dependencies_from_project_references(project_file, doc, dependency_set,
+                                                                visited_project_files)
 
+          # if visited_project_files is an empty set then new up a new set
+          visited_project_files = Set.new if visited_project_files.nil?
           # Look for regular project references
-          doc.css(PROJECT_REFERENCE_SELECTOR).each do |reference_node|
+          project_refs = doc.css(PROJECT_REFERENCE_SELECTOR)
+          # Look for ProjectFile references (dirs.proj)
+          project_files = doc.css(PROJECT_FILE_SELECTOR)
+          ref_nodes = project_refs + project_files
+
+          ref_nodes.each do |reference_node|
             relative_path = dependency_name(reference_node, project_file)
             # This could result from a <ProjectReference Remove="..." /> item.
             next unless relative_path
 
-            # normalize path separators
-            relative_path = relative_path.tr("\\", "/")
-            # path is relative to the project file directory
-            relative_path = File.join(project_file_directory, relative_path)
+            full_project_path = full_path(project_file, relative_path)
 
-            # get absolute path
-            full_path = File.expand_path(relative_path)
-            full_path = full_path[1..-1] unless is_rooted
+            full_project_paths = expand_wildcards_in_project_reference_path(full_project_path)
 
-            referenced_file = dependency_files.find { |f| f.name == full_path }
-            next unless referenced_file
+            full_project_paths.each do |path|
+              # Check if we've already visited this project file
+              next if visited_project_files.include?(path)
 
-            dependency_set(project_file: referenced_file).dependencies.each do |dep|
-              dependency = Dependency.new(
-                name: dep.name,
-                version: dep.version,
-                package_manager: dep.package_manager,
-                requirements: []
-              )
-              dependency_set << dependency
+              visited_project_files.add(path)
+              referenced_file = dependency_files.find { |f| f.name == path }
+              next unless referenced_file
+
+              dependency_set(project_file: referenced_file,
+                             visited_project_files: visited_project_files).dependencies.each do |dep|
+                dependency = Dependency.new(
+                  name: dep.name,
+                  version: dep.version,
+                  package_manager: dep.package_manager,
+                  requirements: []
+                )
+                dependency_set << dependency
+              end
             end
           end
+        end
+
+        sig { params(full_path: T.untyped).returns(T::Array[T.nilable(String)]) }
+        def expand_wildcards_in_project_reference_path(full_path)
+          full_path = T.let(File.join(@repo_contents_path, full_path), T.nilable(String))
+          expanded_wildcard = Dir.glob(T.must(full_path))
+
+          filtered_paths = []
+
+          # For each expanded path, remove the @repo_contents_path prefix and leading slash
+          expanded_wildcard.map do |path|
+            # Remove @repo_contents_path prefix
+            path = path.sub(@repo_contents_path, "")
+            # Remove leading slash
+            path = path[1..-1] if path.start_with?("/")
+            filtered_paths << path
+            path # Return the modified path
+          end
+
+          # If the wildcard didn't match anything, strip the @repo_contents_path prefix and return the original path.
+          filtered_paths.any? ? filtered_paths : [T.must(full_path).sub(@repo_contents_path, "")[1..-1]]
         end
 
         def add_transitive_dependencies_from_packages(dependency_set)
@@ -179,7 +248,8 @@ module Dependabot
             UpdateChecker::DependencyFinder.new(
               dependency: dependency,
               dependency_files: dependency_files,
-              credentials: credentials
+              credentials: credentials,
+              repo_contents_path: @repo_contents_path
             ).transitive_dependencies.each do |transitive_dep|
               visited_dep = transitive_dependencies[transitive_dep.name.downcase]
               next if !visited_dep.nil? && visited_dep.numeric_version > transitive_dep.numeric_version
@@ -281,69 +351,20 @@ module Dependabot
         end
 
         def dependency_has_search_results?(dependency)
-          nuget_configs = dependency_files.select { |f| f.name.casecmp?("nuget.config") }
-          dependency_urls = UpdateChecker::RepositoryFinder.new(
+          dependency_urls = RepositoryFinder.new(
             dependency: dependency,
             credentials: credentials,
             config_files: nuget_configs
           ).dependency_urls
-          if dependency_urls.empty?
-            dependency_urls = [UpdateChecker::RepositoryFinder.get_default_repository_details(dependency.name)]
-          end
+          dependency_urls = [RepositoryFinder.get_default_repository_details(dependency.name)] if dependency_urls.empty?
           dependency_urls.any? do |dependency_url|
             dependency_url_has_matching_result?(dependency.name, dependency_url)
           end
         end
 
         def dependency_url_has_matching_result?(dependency_name, dependency_url)
-          repository_type = dependency_url.fetch(:repository_type)
-          if repository_type == "v3"
-            dependency_url_has_matching_result_v3?(dependency_name, dependency_url)
-          elsif repository_type == "v2"
-            dependency_url_has_matching_result_v2?(dependency_name, dependency_url)
-          else
-            raise "Unknown repository type: #{repository_type}"
-          end
-        end
-
-        def dependency_url_has_matching_result_v3?(dependency_name, dependency_url)
-          url = dependency_url.fetch(:search_url)
-          auth_header = dependency_url.fetch(:auth_header)
-          response = execute_search_for_dependency_url(url, auth_header)
-          return false unless response.status == 200
-
-          body = JSON.parse(response.body)
-          data = body["data"]
-          return false unless data.length.positive?
-
-          data.any? { |result| result["id"].casecmp?(dependency_name) }
-        end
-
-        def dependency_url_has_matching_result_v2?(dependency_name, dependency_url)
-          url = dependency_url.fetch(:versions_url)
-          auth_header = dependency_url.fetch(:auth_header)
-          response = execute_search_for_dependency_url(url, auth_header)
-          return false unless response.status == 200
-
-          doc = Nokogiri::XML(response.body)
-          doc.remove_namespaces!
-          id_nodes = doc.xpath("/feed/entry/properties/Id")
-          found_matching_result = id_nodes.any? do |id_node|
-            return false unless id_node.text
-
-            id_node.text.casecmp?(dependency_name)
-          end
-          found_matching_result
-        end
-
-        def execute_search_for_dependency_url(url, auth_header)
-          cache = ProjectFileParser.dependency_url_search_cache
-          cache[url] ||= Dependabot::RegistryClient.get(
-            url: url,
-            headers: auth_header
-          )
-
-          cache[url]
+          versions = NugetClient.get_package_versions(dependency_name, dependency_url)
+          versions&.any?
         end
 
         def dependency_name(dependency_node, project_file)
@@ -490,10 +511,6 @@ module Dependabot
           end
         end
 
-        def nuget_configs
-          dependency_files.select { |f| f.name.match?(/nuget\.config$/i) }
-        end
-
         def global_json
           dependency_files.find { |f| f.name.casecmp("global.json").zero? }
         end
@@ -502,7 +519,6 @@ module Dependabot
           dependency_files.find { |f| f.name.casecmp(".config/dotnet-tools.json").zero? }
         end
       end
-      # rubocop:enable Metrics/ClassLength
     end
   end
 end

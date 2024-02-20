@@ -330,6 +330,45 @@ RSpec.describe Dependabot::Nuget::FileFetcher do
     # end
   end
 
+  context "directory-relative files can be found when starting in a subdirectory" do
+    let(:directory) { "/src/some-project/" }
+
+    before do
+      GitHubHelpers.stub_requests_for_directory(
+        ->(a, b) { stub_request(a, b) },
+        File.join(__dir__, "..", "..", "fixtures", "github", "csproj_in_subdirectory"),
+        "",
+        url,
+        "token token",
+        "gocardless",
+        "bump",
+        "main"
+      )
+
+      # these files explicitly don't exist
+      ["src/some-project/.config", "src/some-project/Directory.Packages.props"].each do |file|
+        stub_request(:get, File.join(url, "#{file}?ref=sha"))
+          .with(headers: { "Authorization" => "token token" })
+          .to_return(
+            status: 404,
+            body: "{}",
+            headers: { "content-type" => "application/json" }
+          )
+      end
+    end
+
+    it "fetches the NuGet.config file from several directories up" do
+      expect(file_fetcher_instance.files.map(&:name))
+        .to match_array(
+          %w(
+            ../../Directory.Packages.props
+            ../../NuGet.Config
+            some-project.csproj
+          )
+        )
+    end
+  end
+
   context "with a dirs.proj" do
     before do
       GitHubHelpers.stub_requests_for_directory(
@@ -925,7 +964,7 @@ RSpec.describe Dependabot::Nuget::FileFetcher do
     end
   end
 
-  context "witha bad directory" do
+  context "with a bad directory" do
     let(:directory) { "dir/" }
     before do
       stub_request(:get, url + "dir?ref=sha")

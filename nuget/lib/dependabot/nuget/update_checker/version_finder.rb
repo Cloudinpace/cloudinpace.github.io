@@ -3,12 +3,13 @@
 
 require "dependabot/nuget/version"
 require "dependabot/nuget/requirement"
+require "dependabot/update_checkers/base"
 require "dependabot/update_checkers/version_filters"
-require "dependabot/nuget/update_checker"
+require "dependabot/nuget/nuget_client"
 
 module Dependabot
   module Nuget
-    class UpdateChecker
+    class UpdateChecker < Dependabot::UpdateCheckers::Base
       class VersionFinder
         require_relative "compatibility_checker"
         require_relative "repository_finder"
@@ -17,13 +18,15 @@ module Dependabot
 
         def initialize(dependency:, dependency_files:, credentials:,
                        ignored_versions:, raise_on_ignored: false,
-                       security_advisories:)
+                       security_advisories:,
+                       repo_contents_path:)
           @dependency          = dependency
           @dependency_files    = dependency_files
           @credentials         = credentials
           @ignored_versions    = ignored_versions
           @raise_on_ignored    = raise_on_ignored
           @security_advisories = security_advisories
+          @repo_contents_path  = repo_contents_path
         end
 
         def latest_version_details
@@ -57,7 +60,7 @@ module Dependabot
         end
 
         attr_reader :dependency, :dependency_files, :credentials,
-                    :ignored_versions, :security_advisories
+                    :ignored_versions, :security_advisories, :repo_contents_path
 
         private
 
@@ -80,9 +83,10 @@ module Dependabot
           # If the current package version is incompatible, then we don't enforce compatibility.
           # It could appear incompatible because they are ignoring NU1701 or the package is poorly authored.
           return first_version unless version_compatible?(dependency.version)
-          return first_version if version_compatible?(first_version.fetch(:version))
 
-          sorted_versions.bsearch { |v| version_compatible?(v.fetch(:version)) }
+          # once sorted by version, the best we can do is search every package, because it's entirely possible for there
+          # to be incompatible packages both with a higher and lower version number, so no smart searching can be done.
+          sorted_versions.find { |v| version_compatible?(v.fetch(:version)) }
         end
 
         def version_compatible?(version)
@@ -99,7 +103,8 @@ module Dependabot
             dependency: dependency,
             tfm_finder: TfmFinder.new(
               dependency_files: dependency_files,
-              credentials: credentials
+              credentials: credentials,
+              repo_contents_path: repo_contents_path
             )
           )
         end
@@ -234,7 +239,7 @@ module Dependabot
             dependency_urls
             .select { |details| details.fetch(:repository_type) == "v3" }
             .filter_map do |url_details|
-              versions = versions_for_v3_repository(url_details)
+              versions = NugetClient.get_package_versions(dependency.name, url_details)
               next unless versions
 
               { "versions" => versions, "listing_details" => url_details }
@@ -293,43 +298,6 @@ module Dependabot
           nil
         end
 
-        def versions_for_v3_repository(repository_details)
-          # If we have a search URL that returns results we use it
-          # (since it will exclude unlisted versions)
-          if repository_details[:search_url]
-            fetch_versions_from_search_url(repository_details)
-          # Otherwise, use the versions URL
-          elsif repository_details[:versions_url]
-            response = Dependabot::RegistryClient.get(
-              url: repository_details[:versions_url],
-              headers: repository_details[:auth_header]
-            )
-            return unless response.status == 200
-
-            body = remove_wrapping_zero_width_chars(response.body)
-            JSON.parse(body).fetch("versions")
-          end
-        end
-
-        def fetch_versions_from_search_url(repository_details)
-          response = Dependabot::RegistryClient.get(
-            url: repository_details[:search_url],
-            headers: repository_details[:auth_header]
-          )
-          return unless response.status == 200
-
-          body = remove_wrapping_zero_width_chars(response.body)
-          JSON.parse(body).fetch("data")
-              .find { |d| d.fetch("id").casecmp(sanitized_name).zero? }
-              &.fetch("versions")
-              &.map { |d| d.fetch("version") }
-        rescue Excon::Error::Timeout, Excon::Error::Socket
-          repo_url = repository_details[:repository_url]
-          raise if repo_url == RepositoryFinder::DEFAULT_REPOSITORY_URL
-
-          raise PrivateSourceTimedOut, repo_url
-        end
-
         def dependency_urls
           @dependency_urls ||=
             RepositoryFinder.new(
@@ -354,12 +322,6 @@ module Dependabot
 
         def requirement_class
           dependency.requirement_class
-        end
-
-        def remove_wrapping_zero_width_chars(string)
-          string.force_encoding("UTF-8").encode
-                .gsub(/\A[\u200B-\u200D\uFEFF]/, "")
-                .gsub(/[\u200B-\u200D\uFEFF]\Z/, "")
         end
 
         def excon_options

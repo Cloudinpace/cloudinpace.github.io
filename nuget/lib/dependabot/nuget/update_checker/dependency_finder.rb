@@ -4,12 +4,12 @@
 require "nokogiri"
 require "zip"
 require "stringio"
-require "dependabot/nuget/update_checker"
+require "dependabot/update_checkers/base"
 require "dependabot/nuget/version"
 
 module Dependabot
   module Nuget
-    class UpdateChecker
+    class UpdateChecker < Dependabot::UpdateCheckers::Base
       class DependencyFinder
         require_relative "requirements_updater"
         require_relative "nuspec_fetcher"
@@ -26,10 +26,11 @@ module Dependabot
           CacheManager.cache("dependency_finder_fetch_dependencies")
         end
 
-        def initialize(dependency:, dependency_files:, credentials:)
+        def initialize(dependency:, dependency_files:, credentials:, repo_contents_path:)
           @dependency             = dependency
           @dependency_files       = dependency_files
           @credentials            = credentials
+          @repo_contents_path     = repo_contents_path
         end
 
         def transitive_dependencies
@@ -93,7 +94,7 @@ module Dependabot
 
         private
 
-        attr_reader :dependency, :dependency_files, :credentials
+        attr_reader :dependency, :dependency_files, :credentials, :repo_contents_path
 
         def updated_requirements(dep, target_version_details)
           @updated_requirements ||= {}
@@ -121,12 +122,12 @@ module Dependabot
 
         def dependency_urls
           @dependency_urls ||=
-            UpdateChecker::RepositoryFinder.new(
+            RepositoryFinder.new(
               dependency: @dependency,
               credentials: @credentials,
               config_files: nuget_configs
             ).dependency_urls
-                                           .select { |url| url.fetch(:repository_type) == "v3" }
+                            .select { |url| url.fetch(:repository_type) == "v3" }
         end
 
         def fetch_transitive_dependencies(package_id, package_version)
@@ -219,7 +220,8 @@ module Dependabot
             credentials: credentials,
             ignored_versions: [],
             raise_on_ignored: false,
-            security_advisories: []
+            security_advisories: [],
+            repo_contents_path: repo_contents_path
           )
         end
       end

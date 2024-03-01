@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "dependabot/nuget/cache_manager"
+require "dependabot/nuget/http_response_helpers"
 require "dependabot/nuget/update_checker/repository_finder"
 require "sorbet-runtime"
 
@@ -52,14 +53,15 @@ module Dependabot
         doc = execute_xml_nuget_request(repository_details.fetch(:versions_url), repository_details)
         return unless doc
 
-        id_nodes = doc.xpath("/feed/entry/properties/Id")
+        # v2 APIs can differ, but all tested have this title value set to the name of the package
+        title_nodes = doc.xpath("/feed/entry/title")
         matching_versions = Set.new
-        id_nodes.each do |id_node|
-          return nil unless id_node.text
+        title_nodes.each do |title_node|
+          return nil unless title_node.text
 
-          next unless id_node.text.casecmp?(dependency_name)
+          next unless title_node.text.casecmp?(dependency_name)
 
-          version_node = id_node.parent.xpath("Version")
+          version_node = title_node.parent.xpath("properties/Version")
           matching_versions << version_node.text if version_node && version_node.text
         end
 
@@ -162,7 +164,7 @@ module Dependabot
         )
         return unless response.status == 200
 
-        body = remove_wrapping_zero_width_chars(response.body)
+        body = HttpResponseHelpers.remove_wrapping_zero_width_chars(response.body)
         JSON.parse(body)
       end
 
@@ -192,13 +194,6 @@ module Dependabot
         raise if repo_url == Dependabot::Nuget::RepositoryFinder::DEFAULT_REPOSITORY_URL
 
         raise PrivateSourceTimedOut, repo_url
-      end
-
-      sig { params(string: String).returns(String) }
-      private_class_method def self.remove_wrapping_zero_width_chars(string)
-        string.force_encoding("UTF-8").encode
-              .gsub(/\A[\u200B-\u200D\uFEFF]/, "")
-              .gsub(/[\u200B-\u200D\uFEFF]\Z/, "")
       end
     end
   end

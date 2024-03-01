@@ -21,6 +21,8 @@ using NuGetUpdater.Core.Utilities;
 
 namespace NuGetUpdater.Core;
 
+using EvaluationResult = (MSBuildHelper.EvaluationResultType ResultType, string EvaluatedValue, string? ErrorMessage);
+
 internal static partial class MSBuildHelper
 {
     public static string MSBuildPath { get; private set; } = string.Empty;
@@ -57,7 +59,10 @@ internal static partial class MSBuildHelper
                 if (property.Name.Equals("TargetFramework", StringComparison.OrdinalIgnoreCase) ||
                     property.Name.Equals("TargetFrameworks", StringComparison.OrdinalIgnoreCase))
                 {
-                    targetFrameworkValues.Add(property.Value);
+                    foreach (var tfm in property.Value.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    {
+                        targetFrameworkValues.Add(tfm);
+                    }
                 }
                 else if (property.Name.Equals("TargetFrameworkVersion", StringComparison.OrdinalIgnoreCase))
                 {
@@ -75,8 +80,16 @@ internal static partial class MSBuildHelper
 
         foreach (var targetFrameworkValue in targetFrameworkValues)
         {
-            var tfms = targetFrameworkValue;
-            tfms = GetRootedValue(tfms, propertyInfo);
+            var (resultType, tfms, errorMessage) =
+                GetEvaluatedValue(targetFrameworkValue, propertyInfo, propertiesToIgnore: ["TargetFramework", "TargetFrameworks"]);
+            if (resultType == EvaluationResultType.PropertyIgnored)
+            {
+                continue;
+            }
+            else if (resultType != EvaluationResultType.Success)
+            {
+                throw new InvalidDataException(errorMessage);
+            }
 
             if (string.IsNullOrEmpty(tfms))
             {
@@ -101,10 +114,18 @@ internal static partial class MSBuildHelper
     public static IEnumerable<string> GetProjectPathsFromProject(string projFilePath)
     {
         var projectStack = new Stack<(string folderPath, ProjectRootElement)>();
-        var projectRootElement = ProjectRootElement.Open(projFilePath);
         var processedProjectFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using var projectCollection = new ProjectCollection();
 
-        projectStack.Push((Path.GetFullPath(Path.GetDirectoryName(projFilePath)!), projectRootElement));
+        try
+        {
+            var projectRootElement = ProjectRootElement.Open(projFilePath, projectCollection);
+            projectStack.Push((Path.GetFullPath(Path.GetDirectoryName(projFilePath)!), projectRootElement));
+        }
+        catch (InvalidProjectFileException)
+        {
+            yield break; // Skip invalid project files
+        }
 
         while (projectStack.Count > 0)
         {
@@ -137,7 +158,7 @@ internal static partial class MSBuildHelper
                         // If there is some MSBuild logic that needs to run to fully resolve the path skip the project
                         if (File.Exists(file))
                         {
-                            var additionalProjectRootElement = ProjectRootElement.Open(file);
+                            var additionalProjectRootElement = ProjectRootElement.Open(file, projectCollection);
                             projectStack.Push((Path.GetFullPath(Path.GetDirectoryName(file)!), additionalProjectRootElement));
                             processedProjectFiles.Add(file);
                         }
@@ -222,9 +243,13 @@ internal static partial class MSBuildHelper
             }
 
             // Walk the property replacements until we don't find another one.
-            packageVersion = GetRootedValue(packageVersion, propertyInfo);
+            var evaluationResult = GetEvaluatedValue(packageVersion, propertyInfo);
+            if (evaluationResult.ResultType != EvaluationResultType.Success)
+            {
+                throw new InvalidDataException(evaluationResult.ErrorMessage);
+            }
 
-            packageVersion = packageVersion.TrimStart('[', '(').TrimEnd(']', ')');
+            packageVersion = evaluationResult.EvaluatedValue.TrimStart('[', '(').TrimEnd(']', ')');
 
             // We don't know the version for range requirements or wildcard
             // requirements, so return "" for these.
@@ -237,25 +262,32 @@ internal static partial class MSBuildHelper
     /// <summary>
     /// Given an MSBuild string and a set of properties, returns our best guess at the final value MSBuild will evaluate to.
     /// </summary>
-    /// <param name="msbuildString"></param>
-    /// <param name="propertyInfo"></param>
-    /// <returns></returns>
-    public static string GetRootedValue(string msbuildString, Dictionary<string, string> propertyInfo)
+    public static EvaluationResult GetEvaluatedValue(string msbuildString, Dictionary<string, string> propertyInfo, params string[] propertiesToIgnore)
     {
+        var ignoredProperties = new HashSet<string>(propertiesToIgnore, StringComparer.OrdinalIgnoreCase);
         var seenProperties = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         while (TryGetPropertyName(msbuildString, out var propertyName))
         {
-            if (!seenProperties.Add(propertyName))
+            if (ignoredProperties.Contains(propertyName))
             {
-                throw new InvalidDataException($"Property '{propertyName}' has a circular reference.");
+                return (EvaluationResultType.PropertyIgnored, msbuildString, $"Property '{propertyName}' is ignored.");
             }
 
-            msbuildString = propertyInfo.TryGetValue(propertyName, out var propertyValue)
-                ? msbuildString.Replace($"$({propertyName})", propertyValue)
-                : throw new InvalidDataException($"Property '{propertyName}' was not found.");
+            if (!seenProperties.Add(propertyName))
+            {
+                return (EvaluationResultType.CircularReference, msbuildString, $"Property '{propertyName}' has a circular reference.");
+            }
+
+            if (!propertyInfo.TryGetValue(propertyName, out var propertyValue))
+            {
+                return (EvaluationResultType.PropertyNotFound, msbuildString, $"Property '{propertyName}' was not found.");
+            }
+
+            msbuildString = msbuildString.Replace($"$({propertyName})", propertyValue);
         }
 
-        return msbuildString;
+        return (EvaluationResultType.Success, msbuildString, null);
     }
 
     public static bool TryGetPropertyName(string versionContent, [NotNullWhen(true)] out string? propertyName)
@@ -360,7 +392,17 @@ internal static partial class MSBuildHelper
         await File.WriteAllTextAsync(tempProjectPath, projectContents);
 
         // prevent directory crawling
-        await File.WriteAllTextAsync(Path.Combine(tempDir.FullName, "Directory.Build.props"), "<Project />");
+        await File.WriteAllTextAsync(
+            Path.Combine(tempDir.FullName, "Directory.Build.props"),
+            """
+            <Project>
+              <PropertyGroup>
+                <!-- For Windows-specific apps -->
+                <EnableWindowsTargeting>true</EnableWindowsTargeting>
+              </PropertyGroup>
+            </Project>
+            """);
+
         await File.WriteAllTextAsync(Path.Combine(tempDir.FullName, "Directory.Build.targets"), "<Project />");
         await File.WriteAllTextAsync(Path.Combine(tempDir.FullName, "Directory.Packages.props"), "<Project />");
 
@@ -482,4 +524,12 @@ internal static partial class MSBuildHelper
 
     [GeneratedRegex("^\\s*NuGetData::Package=(?<PackageName>[^,]+), Version=(?<PackageVersion>.+)$")]
     private static partial Regex PackagePattern();
+
+    internal enum EvaluationResultType
+    {
+        Success,
+        PropertyIgnored,
+        CircularReference,
+        PropertyNotFound,
+    }
 }
